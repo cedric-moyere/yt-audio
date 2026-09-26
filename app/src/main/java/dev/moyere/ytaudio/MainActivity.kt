@@ -17,7 +17,6 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
-import com.yausername.youtubedl_android.YoutubeDLException
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
 import kotlin.concurrent.thread
@@ -32,12 +31,6 @@ class MainActivity : Activity() {
     private lateinit var errorText: TextView
 
     @Volatile private var ready = false
-    private val prefs by lazy { getSharedPreferences("ytaudio", MODE_PRIVATE) }
-
-    companion object {
-        private const val UPDATE_INTERVAL_MS = 24L * 60 * 60 * 1000  // 1 fois par jour max
-        private const val KEY_LAST_UPDATE = "last_ytdlp_update"
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -118,21 +111,7 @@ class MainActivity : Activity() {
         thread {
             val workDir = File(cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
             try {
-                // Mise à jour de yt-dlp au plus une fois par jour
-                val lastUpdate = prefs.getLong(KEY_LAST_UPDATE, 0L)
-                if (System.currentTimeMillis() - lastUpdate > UPDATE_INTERVAL_MS) {
-                    updateYtDlp()
-                }
-
-                try {
-                    runDownload(url, workDir)
-                } catch (e: YoutubeDLException) {
-                    // Échec : souvent dû à un changement côté YouTube.
-                    // On force une mise à jour de yt-dlp et on réessaie une fois.
-                    if (!updateYtDlp()) throw e
-                    workDir.listFiles()?.forEach { it.deleteRecursively() }
-                    runDownload(url, workDir)
-                }
+                runDownload(url, workDir)
 
                 val mp3 = workDir.listFiles()?.firstOrNull { it.extension.equals("mp3", true) }
                     ?: throw IllegalStateException("Aucun fichier MP3 produit.")
@@ -155,19 +134,6 @@ class MainActivity : Activity() {
             } finally {
                 workDir.deleteRecursively()
             }
-        }
-    }
-
-    /** Met à jour yt-dlp. Renvoie true si une mise à jour a été faite ou vérifiée. */
-    private fun updateYtDlp(): Boolean {
-        ui { progressBar.isIndeterminate = true; statusText.text = "Mise à jour de yt-dlp…" }
-        return try {
-            YoutubeDL.getInstance()
-                .updateYoutubeDL(applicationContext, YoutubeDL.UpdateChannel.STABLE)
-            prefs.edit().putLong(KEY_LAST_UPDATE, System.currentTimeMillis()).apply()
-            true
-        } catch (_: Throwable) {
-            false // pas bloquant : on garde la version actuelle
         }
     }
 
@@ -233,11 +199,33 @@ class MainActivity : Activity() {
     }
 
     private fun showError(e: Throwable) {
-        val msg = buildString {
+        val details = buildString {
             append(e.javaClass.simpleName).append(": ").append(e.message ?: "(sans message)")
             e.cause?.let { append("\n\nCause : ").append(it.message) }
         }
+        val msg = if (looksOutdated(details)) {
+            "⚠️ Le moteur de téléchargement (yt-dlp) semble dépassé : YouTube a " +
+                "probablement changé quelque chose. Il faut installer une nouvelle " +
+                "version de l'appli.\n\nDétail :\n$details"
+        } else details
         showError(msg)
+    }
+
+    /** Erreurs typiques d'un yt-dlp trop ancien face aux changements de YouTube. */
+    private fun looksOutdated(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(
+            "update to the latest version",
+            "yt-dlp -u",
+            "unable to extract",
+            "nsig extraction failed",
+            "signature extraction failed",
+            "sign in to confirm you",
+            "http error 403",
+            "requested format is not available",
+            "player response",
+            "please report this issue",
+        ).any { it in t }
     }
 
     private fun showError(msg: String) {
