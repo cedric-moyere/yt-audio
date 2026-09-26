@@ -11,11 +11,21 @@ android {
         applicationId = "dev.moyere.ytaudio"
         minSdk = 29          // Android 10+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
         ndk {
             // Téléphones récents uniquement : APK beaucoup plus léger
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // Clé fixe : permet d'installer les mises à jour par-dessus l'ancienne version
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("ytaudio.keystore")
+            storePassword = "ytaudio"
+            keyAlias = "ytaudio"
+            keyPassword = "ytaudio"
         }
     }
 

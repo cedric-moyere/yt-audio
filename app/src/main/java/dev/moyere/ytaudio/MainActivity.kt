@@ -5,15 +5,19 @@ import android.content.ContentValues
 import android.content.Intent
 import android.os.Bundle
 import android.os.Environment
+import android.text.Editable
+import android.text.TextWatcher
 import android.provider.MediaStore
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLException
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
 import kotlin.concurrent.thread
@@ -22,12 +26,18 @@ class MainActivity : Activity() {
 
     private lateinit var urlInput: EditText
     private lateinit var downloadButton: Button
+    private lateinit var clearButton: ImageButton
     private lateinit var progressBar: ProgressBar
     private lateinit var statusText: TextView
     private lateinit var errorText: TextView
 
     @Volatile private var ready = false
-    @Volatile private var updateDone = false
+    private val prefs by lazy { getSharedPreferences("ytaudio", MODE_PRIVATE) }
+
+    companion object {
+        private const val UPDATE_INTERVAL_MS = 24L * 60 * 60 * 1000  // 1 fois par jour max
+        private const val KEY_LAST_UPDATE = "last_ytdlp_update"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,11 +45,24 @@ class MainActivity : Activity() {
 
         urlInput = findViewById(R.id.urlInput)
         downloadButton = findViewById(R.id.downloadButton)
+        clearButton = findViewById(R.id.clearButton)
         progressBar = findViewById(R.id.progressBar)
         statusText = findViewById(R.id.statusText)
         errorText = findViewById(R.id.errorText)
 
         downloadButton.setOnClickListener { startDownload() }
+        clearButton.setOnClickListener {
+            urlInput.text.clear()
+            hideError()
+            urlInput.requestFocus()
+        }
+        urlInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                clearButton.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+            }
+        })
         urlInput.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) { startDownload(); true } else false
         }
@@ -95,40 +118,20 @@ class MainActivity : Activity() {
         thread {
             val workDir = File(cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
             try {
-                // YouTube change souvent : on met yt-dlp à jour une fois par session.
-                if (!updateDone) {
-                    ui { statusText.text = "Mise à jour de yt-dlp…" }
-                    try {
-                        YoutubeDL.getInstance()
-                            .updateYoutubeDL(applicationContext, YoutubeDL.UpdateChannel.STABLE)
-                    } catch (_: Throwable) { /* pas bloquant : on garde la version embarquée */ }
-                    updateDone = true
+                // Mise à jour de yt-dlp au plus une fois par jour
+                val lastUpdate = prefs.getLong(KEY_LAST_UPDATE, 0L)
+                if (System.currentTimeMillis() - lastUpdate > UPDATE_INTERVAL_MS) {
+                    updateYtDlp()
                 }
 
-                val request = YoutubeDLRequest(url).apply {
-                    addOption("--no-playlist")
-                    addOption("-x")                       // audio uniquement
-                    addOption("--audio-format", "mp3")
-                    addOption("--audio-quality", "0")     // meilleure qualité VBR
-                    addOption("--embed-metadata")
-                    addOption("-o", "${workDir.absolutePath}/%(title).150B.%(ext)s")
-                }
-
-                YoutubeDL.getInstance().execute(request, null, false) { progress, eta, line ->
-                    ui {
-                        when {
-                            line.contains("[ExtractAudio]") -> {
-                                progressBar.isIndeterminate = true
-                                statusText.text = "Conversion en MP3…"
-                            }
-                            progress >= 0f -> {
-                                progressBar.isIndeterminate = false
-                                progressBar.progress = progress.toInt()
-                                statusText.text = "Téléchargement : ${progress.toInt()} %" +
-                                    if (eta > 0) " (reste ${eta}s)" else ""
-                            }
-                        }
-                    }
+                try {
+                    runDownload(url, workDir)
+                } catch (e: YoutubeDLException) {
+                    // Échec : souvent dû à un changement côté YouTube.
+                    // On force une mise à jour de yt-dlp et on réessaie une fois.
+                    if (!updateYtDlp()) throw e
+                    workDir.listFiles()?.forEach { it.deleteRecursively() }
+                    runDownload(url, workDir)
                 }
 
                 val mp3 = workDir.listFiles()?.firstOrNull { it.extension.equals("mp3", true) }
@@ -151,6 +154,47 @@ class MainActivity : Activity() {
                 }
             } finally {
                 workDir.deleteRecursively()
+            }
+        }
+    }
+
+    /** Met à jour yt-dlp. Renvoie true si une mise à jour a été faite ou vérifiée. */
+    private fun updateYtDlp(): Boolean {
+        ui { progressBar.isIndeterminate = true; statusText.text = "Mise à jour de yt-dlp…" }
+        return try {
+            YoutubeDL.getInstance()
+                .updateYoutubeDL(applicationContext, YoutubeDL.UpdateChannel.STABLE)
+            prefs.edit().putLong(KEY_LAST_UPDATE, System.currentTimeMillis()).apply()
+            true
+        } catch (_: Throwable) {
+            false // pas bloquant : on garde la version actuelle
+        }
+    }
+
+    private fun runDownload(url: String, workDir: File) {
+        val request = YoutubeDLRequest(url).apply {
+            addOption("--no-playlist")
+            addOption("-x")                       // audio uniquement
+            addOption("--audio-format", "mp3")
+            addOption("--audio-quality", "0")     // meilleure qualité VBR
+            addOption("--embed-metadata")
+            addOption("-o", "${workDir.absolutePath}/%(title).150B.%(ext)s")
+        }
+        ui { statusText.text = "Démarrage…" }
+        YoutubeDL.getInstance().execute(request, null, false) { progress, eta, line ->
+            ui {
+                when {
+                    line.contains("[ExtractAudio]") -> {
+                        progressBar.isIndeterminate = true
+                        statusText.text = "Conversion en MP3…"
+                    }
+                    progress >= 0f -> {
+                        progressBar.isIndeterminate = false
+                        progressBar.progress = progress.toInt()
+                        statusText.text = "Téléchargement : ${progress.toInt()} %" +
+                            if (eta > 0) " (reste ${eta}s)" else ""
+                    }
+                }
             }
         }
     }
@@ -183,6 +227,7 @@ class MainActivity : Activity() {
 
     private fun setBusy(busy: Boolean, status: String) {
         downloadButton.isEnabled = !busy
+        clearButton.isEnabled = !busy
         urlInput.isEnabled = !busy
         statusText.text = status
     }
